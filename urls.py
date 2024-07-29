@@ -1,22 +1,50 @@
-"""
-URL configuration for apple_showcase project.
-
-The `urlpatterns` list routes URLs to views. For more information please see:
-    https://docs.djangoproject.com/en/5.0/topics/http/urls/
-Examples:
-Function views
-    1. Add an import:  from my_app import views
-    2. Add a URL to urlpatterns:  path('', views.home, name='home')
-Class-based views
-    1. Add an import:  from other_app.views import Home
-    2. Add a URL to urlpatterns:  path('', Home.as_view(), name='home')
-Including another URLconf
-    1. Import the include() function: from django.urls import include, path
-    2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
-"""
-from django.contrib import admin
-from django.urls import path
+from django.contrib.admindocs import views
+from django.urls import path, re_path
 
 urlpatterns = [
-    path("admin/", admin.site.urls),
+    path(
+        "",
+        views.BaseAdminDocsView.as_view(template_name="admin_doc/index.html"),
+        name="django-admindocs-docroot",
+    ),
+    path(
+        "bookmarklets/",
+        views.BookmarkletsView.as_view(),
+        name="django-admindocs-bookmarklets",
+    ),
+    path(
+        "tags/",
+        views.TemplateTagIndexView.as_view(),
+        name="django-admindocs-tags",
+    ),
+    path(
+        "filters/",
+        views.TemplateFilterIndexView.as_view(),
+        name="django-admindocs-filters",
+    ),
+    path(
+        "views/",
+        views.ViewIndexView.as_view(),
+        name="django-admindocs-views-index",
+    ),
+    path(
+        "views/<view>/",
+        views.ViewDetailView.as_view(),
+        name="django-admindocs-views-detail",
+    ),
+    path(
+        "models/",
+        views.ModelIndexView.as_view(),
+        name="django-admindocs-models-index",
+    ),
+    re_path(
+        r"^models/(?P<app_label>[^.]+)\.(?P<model_name>[^/]+)/$",
+        views.ModelDetailView.as_view(),
+        name="django-admindocs-models-detail",
+    ),
+    path(
+        "templates/<path:template>/",
+        views.TemplateDetailView.as_view(),
+        name="django-admindocs-templates",
+    ),
 ]
