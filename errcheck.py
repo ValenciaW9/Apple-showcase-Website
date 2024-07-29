@@ -1,142 +1,96 @@
 """
- This module houses the error-checking routines used by the GDAL
- ctypes prototypes.
+ Error checking functions for GEOS ctypes prototype functions.
 """
 
 from ctypes import c_void_p, string_at
 
-from django.contrib.gis.gdal.error import GDALException, SRSException, check_err
-from django.contrib.gis.gdal.libgdal import lgdal
+from django.contrib.gis.geos.error import GEOSException
+from django.contrib.gis.geos.libgeos import GEOSFuncFactory
+
+# Getting the `free` routine used to free the memory allocated for
+# string pointers returned by GEOS.
+free = GEOSFuncFactory("GEOSFree")
+free.argtypes = [c_void_p]
 
 
-# Helper routines for retrieving pointers and/or values from
-# arguments passed in by reference.
-def arg_byref(args, offset=-1):
-    "Return the pointer argument's by-reference value."
-    return args[offset]._obj.value
+def last_arg_byref(args):
+    "Return the last C argument's value by reference."
+    return args[-1]._obj.value
 
 
-def ptr_byref(args, offset=-1):
-    "Return the pointer argument passed in by-reference."
-    return args[offset]._obj
+def check_dbl(result, func, cargs):
+    "Check the status code and returns the double value passed in by reference."
+    # Checking the status code
+    if result != 1:
+        return None
+    # Double passed in by reference, return its value.
+    return last_arg_byref(cargs)
 
 
-# ### String checking Routines ###
-def check_const_string(result, func, cargs, offset=None, cpl=False):
-    """
-    Similar functionality to `check_string`, but does not free the pointer.
-    """
-    if offset:
-        check_err(result, cpl=cpl)
-        ptr = ptr_byref(cargs, offset)
-        return ptr.value
+def check_geom(result, func, cargs):
+    "Error checking on routines that return Geometries."
+    if not result:
+        raise GEOSException(
+            'Error encountered checking Geometry returned from GEOS C function "%s".'
+            % func.__name__
+        )
+    return result
+
+
+def check_minus_one(result, func, cargs):
+    "Error checking on routines that should not return -1."
+    if result == -1:
+        raise GEOSException(
+            'Error encountered in GEOS C function "%s".' % func.__name__
+        )
     else:
         return result
 
 
-def check_string(result, func, cargs, offset=-1, str_result=False):
-    """
-    Check the string output returned from the given function, and free
-    the string pointer allocated by OGR.  The `str_result` keyword
-    may be used when the result is the string pointer, otherwise
-    the OGR error code is assumed.  The `offset` keyword may be used
-    to extract the string pointer passed in by-reference at the given
-    slice offset in the function arguments.
-    """
-    if str_result:
-        # For routines that return a string.
-        ptr = result
-        if not ptr:
-            s = None
-        else:
-            s = string_at(result)
+def check_predicate(result, func, cargs):
+    "Error checking for unary/binary predicate functions."
+    if result == 1:
+        return True
+    elif result == 0:
+        return False
     else:
-        # Error-code return specified.
-        check_err(result)
-        ptr = ptr_byref(cargs, offset)
-        # Getting the string value
-        s = ptr.value
-    # Correctly freeing the allocated memory behind GDAL pointer
-    # with the VSIFree routine.
-    if ptr:
-        lgdal.VSIFree(ptr)
+        raise GEOSException(
+            'Error encountered on GEOS C predicate function "%s".' % func.__name__
+        )
+
+
+def check_sized_string(result, func, cargs):
+    """
+    Error checking for routines that return explicitly sized strings.
+
+    This frees the memory allocated by GEOS at the result pointer.
+    """
+    if not result:
+        raise GEOSException(
+            'Invalid string pointer returned by GEOS C function "%s"' % func.__name__
+        )
+    # A c_size_t object is passed in by reference for the second
+    # argument on these routines, and its needed to determine the
+    # correct size.
+    s = string_at(result, last_arg_byref(cargs))
+    # Freeing the memory allocated within GEOS
+    free(result)
     return s
 
 
-# ### DataSource, Layer error-checking ###
+def check_string(result, func, cargs):
+    """
+    Error checking for routines that return strings.
 
-
-# ### Envelope checking ###
-def check_envelope(result, func, cargs, offset=-1):
-    "Check a function that returns an OGR Envelope by reference."
-    return ptr_byref(cargs, offset)
-
-
-# ### Geometry error-checking routines ###
-def check_geom(result, func, cargs):
-    "Check a function that returns a geometry."
-    # OGR_G_Clone may return an integer, even though the
-    # restype is set to c_void_p
-    if isinstance(result, int):
-        result = c_void_p(result)
+    This frees the memory allocated by GEOS at the result pointer.
+    """
     if not result:
-        raise GDALException(
-            'Invalid geometry pointer returned from "%s".' % func.__name__
+        raise GEOSException(
+            'Error encountered checking string return value in GEOS C function "%s".'
+            % func.__name__
         )
-    return result
-
-
-def check_geom_offset(result, func, cargs, offset=-1):
-    "Check the geometry at the given offset in the C parameter list."
-    check_err(result)
-    geom = ptr_byref(cargs, offset=offset)
-    return check_geom(geom, func, cargs)
-
-
-# ### Spatial Reference error-checking routines ###
-def check_srs(result, func, cargs):
-    if isinstance(result, int):
-        result = c_void_p(result)
-    if not result:
-        raise SRSException(
-            'Invalid spatial reference pointer returned from "%s".' % func.__name__
-        )
-    return result
-
-
-# ### Other error-checking routines ###
-def check_arg_errcode(result, func, cargs, cpl=False):
-    """
-    The error code is returned in the last argument, by reference.
-    Check its value with `check_err` before returning the result.
-    """
-    check_err(arg_byref(cargs), cpl=cpl)
-    return result
-
-
-def check_errcode(result, func, cargs, cpl=False):
-    """
-    Check the error code returned (c_int).
-    """
-    check_err(result, cpl=cpl)
-
-
-def check_pointer(result, func, cargs):
-    "Make sure the result pointer is valid."
-    if isinstance(result, int):
-        result = c_void_p(result)
-    if result:
-        return result
-    else:
-        raise GDALException('Invalid pointer returned from "%s"' % func.__name__)
-
-
-def check_str_arg(result, func, cargs):
-    """
-    This is for the OSRGet[Angular|Linear]Units functions, which
-    require that the returned string pointer not be freed.  This
-    returns both the double and string values.
-    """
-    dbl = result
-    ptr = cargs[-1]._obj
-    return dbl, ptr.value.decode()
+    # Getting the string value at the pointer address.
+    s = string_at(result)
+    # Freeing the memory allocated within GEOS
+    free(result)
+    return s

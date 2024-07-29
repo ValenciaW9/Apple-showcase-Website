@@ -1,211 +1,95 @@
-"""
- This module houses the GEOSCoordSeq object, which is used internally
- by GEOSGeometry to house the actual coordinates of the Point,
- LineString, and LinearRing geometries.
-"""
+from ctypes import POINTER, c_byte, c_double, c_int, c_uint
 
-from ctypes import byref, c_byte, c_double, c_uint
-
-from django.contrib.gis.geos import prototypes as capi
-from django.contrib.gis.geos.base import GEOSBase
-from django.contrib.gis.geos.error import GEOSException
-from django.contrib.gis.geos.libgeos import CS_PTR
-from django.contrib.gis.shortcuts import numpy
+from django.contrib.gis.geos.libgeos import CS_PTR, GEOM_PTR, GEOSFuncFactory
+from django.contrib.gis.geos.prototypes.errcheck import GEOSException, last_arg_byref
 
 
-class GEOSCoordSeq(GEOSBase):
-    "The internal representation of a list of coordinates inside a Geometry."
+# ## Error-checking routines specific to coordinate sequences. ##
+def check_cs_op(result, func, cargs):
+    "Check the status code of a coordinate sequence operation."
+    if result == 0:
+        raise GEOSException("Could not set value on coordinate sequence")
+    else:
+        return result
 
-    ptr_type = CS_PTR
 
-    def __init__(self, ptr, z=False):
-        "Initialize from a GEOS pointer."
-        if not isinstance(ptr, CS_PTR):
-            raise TypeError("Coordinate sequence should initialize with a CS_PTR.")
-        self._ptr = ptr
-        self._z = z
+def check_cs_get(result, func, cargs):
+    "Check the coordinate sequence retrieval."
+    check_cs_op(result, func, cargs)
+    # Object in by reference, return its value.
+    return last_arg_byref(cargs)
 
-    def __iter__(self):
-        "Iterate over each point in the coordinate sequence."
-        for i in range(self.size):
-            yield self[i]
 
-    def __len__(self):
-        "Return the number of points in the coordinate sequence."
-        return self.size
+# ## Coordinate sequence prototype factory classes. ##
+class CsInt(GEOSFuncFactory):
+    "For coordinate sequence routines that return an integer."
+    argtypes = [CS_PTR, POINTER(c_uint)]
+    restype = c_int
+    errcheck = staticmethod(check_cs_get)
 
-    def __str__(self):
-        "Return the string representation of the coordinate sequence."
-        return str(self.tuple)
 
-    def __getitem__(self, index):
-        "Return the coordinate sequence value at the given index."
-        self._checkindex(index)
-        return self._point_getter(index)
+class CsOperation(GEOSFuncFactory):
+    "For coordinate sequence operations."
+    restype = c_int
 
-    def __setitem__(self, index, value):
-        "Set the coordinate sequence value at the given index."
-        # Checking the input value
-        if isinstance(value, (list, tuple)):
-            pass
-        elif numpy and isinstance(value, numpy.ndarray):
-            pass
+    def __init__(self, *args, ordinate=False, get=False, **kwargs):
+        if get:
+            # Get routines have double parameter passed-in by reference.
+            errcheck = check_cs_get
+            dbl_param = POINTER(c_double)
         else:
-            raise TypeError(
-                "Must set coordinate with a sequence (list, tuple, or numpy array)."
-            )
-        # Checking the dims of the input
-        if self.dims == 3 and self._z:
-            n_args = 3
-            point_setter = self._set_point_3d
+            errcheck = check_cs_op
+            dbl_param = c_double
+
+        if ordinate:
+            # Get/Set ordinate routines have an extra uint parameter.
+            argtypes = [CS_PTR, c_uint, c_uint, dbl_param]
         else:
-            n_args = 2
-            point_setter = self._set_point_2d
-        if len(value) != n_args:
-            raise TypeError("Dimension of value does not match.")
-        self._checkindex(index)
-        point_setter(index, value)
+            argtypes = [CS_PTR, c_uint, dbl_param]
 
-    # #### Internal Routines ####
-    def _checkindex(self, index):
-        "Check the given index."
-        if not (0 <= index < self.size):
-            raise IndexError("invalid GEOS Geometry index: %s" % index)
-
-    def _checkdim(self, dim):
-        "Check the given dimension."
-        if dim < 0 or dim > 2:
-            raise GEOSException('invalid ordinate dimension "%d"' % dim)
-
-    def _get_x(self, index):
-        return capi.cs_getx(self.ptr, index, byref(c_double()))
-
-    def _get_y(self, index):
-        return capi.cs_gety(self.ptr, index, byref(c_double()))
-
-    def _get_z(self, index):
-        return capi.cs_getz(self.ptr, index, byref(c_double()))
-
-    def _set_x(self, index, value):
-        capi.cs_setx(self.ptr, index, value)
-
-    def _set_y(self, index, value):
-        capi.cs_sety(self.ptr, index, value)
-
-    def _set_z(self, index, value):
-        capi.cs_setz(self.ptr, index, value)
-
-    @property
-    def _point_getter(self):
-        return self._get_point_3d if self.dims == 3 and self._z else self._get_point_2d
-
-    def _get_point_2d(self, index):
-        return (self._get_x(index), self._get_y(index))
-
-    def _get_point_3d(self, index):
-        return (self._get_x(index), self._get_y(index), self._get_z(index))
-
-    def _set_point_2d(self, index, value):
-        x, y = value
-        self._set_x(index, x)
-        self._set_y(index, y)
-
-    def _set_point_3d(self, index, value):
-        x, y, z = value
-        self._set_x(index, x)
-        self._set_y(index, y)
-        self._set_z(index, z)
-
-    # #### Ordinate getting and setting routines ####
-    def getOrdinate(self, dimension, index):
-        "Return the value for the given dimension and index."
-        self._checkindex(index)
-        self._checkdim(dimension)
-        return capi.cs_getordinate(self.ptr, index, dimension, byref(c_double()))
-
-    def setOrdinate(self, dimension, index, value):
-        "Set the value for the given dimension and index."
-        self._checkindex(index)
-        self._checkdim(dimension)
-        capi.cs_setordinate(self.ptr, index, dimension, value)
-
-    def getX(self, index):
-        "Get the X value at the index."
-        return self.getOrdinate(0, index)
-
-    def setX(self, index, value):
-        "Set X with the value at the given index."
-        self.setOrdinate(0, index, value)
-
-    def getY(self, index):
-        "Get the Y value at the given index."
-        return self.getOrdinate(1, index)
-
-    def setY(self, index, value):
-        "Set Y with the value at the given index."
-        self.setOrdinate(1, index, value)
-
-    def getZ(self, index):
-        "Get Z with the value at the given index."
-        return self.getOrdinate(2, index)
-
-    def setZ(self, index, value):
-        "Set Z with the value at the given index."
-        self.setOrdinate(2, index, value)
-
-    # ### Dimensions ###
-    @property
-    def size(self):
-        "Return the size of this coordinate sequence."
-        return capi.cs_getsize(self.ptr, byref(c_uint()))
-
-    @property
-    def dims(self):
-        "Return the dimensions of this coordinate sequence."
-        return capi.cs_getdims(self.ptr, byref(c_uint()))
-
-    @property
-    def hasz(self):
-        """
-        Return whether this coordinate sequence is 3D. This property value is
-        inherited from the parent Geometry.
-        """
-        return self._z
-
-    # ### Other Methods ###
-    def clone(self):
-        "Clone this coordinate sequence."
-        return GEOSCoordSeq(capi.cs_clone(self.ptr), self.hasz)
-
-    @property
-    def kml(self):
-        "Return the KML representation for the coordinates."
-        # Getting the substitution string depending on whether the coordinates have
-        #  a Z dimension.
-        if self.hasz:
-            substr = "%s,%s,%s "
-        else:
-            substr = "%s,%s,0 "
-        return (
-            "<coordinates>%s</coordinates>"
-            % "".join(substr % self[i] for i in range(len(self))).strip()
+        super().__init__(
+            *args, **{**kwargs, "errcheck": errcheck, "argtypes": argtypes}
         )
 
-    @property
-    def tuple(self):
-        "Return a tuple version of this coordinate sequence."
-        n = self.size
-        get_point = self._point_getter
-        if n == 1:
-            return get_point(0)
-        return tuple(get_point(i) for i in range(n))
 
-    @property
-    def is_counterclockwise(self):
-        """Return whether this coordinate sequence is counterclockwise."""
-        ret = c_byte()
-        if not capi.cs_is_ccw(self.ptr, byref(ret)):
+class CsOutput(GEOSFuncFactory):
+    restype = CS_PTR
+
+    @staticmethod
+    def errcheck(result, func, cargs):
+        if not result:
             raise GEOSException(
-                'Error encountered in GEOS C function "%s".' % capi.cs_is_ccw.func_name
+                "Error encountered checking Coordinate Sequence returned from GEOS "
+                'C function "%s".' % func.__name__
             )
-        return ret.value == 1
+        return result
+
+
+# ## Coordinate Sequence ctypes prototypes ##
+
+# Coordinate Sequence constructors & cloning.
+cs_clone = CsOutput("GEOSCoordSeq_clone", argtypes=[CS_PTR])
+create_cs = CsOutput("GEOSCoordSeq_create", argtypes=[c_uint, c_uint])
+get_cs = CsOutput("GEOSGeom_getCoordSeq", argtypes=[GEOM_PTR])
+
+# Getting, setting ordinate
+cs_getordinate = CsOperation("GEOSCoordSeq_getOrdinate", ordinate=True, get=True)
+cs_setordinate = CsOperation("GEOSCoordSeq_setOrdinate", ordinate=True)
+
+# For getting, x, y, z
+cs_getx = CsOperation("GEOSCoordSeq_getX", get=True)
+cs_gety = CsOperation("GEOSCoordSeq_getY", get=True)
+cs_getz = CsOperation("GEOSCoordSeq_getZ", get=True)
+
+# For setting, x, y, z
+cs_setx = CsOperation("GEOSCoordSeq_setX")
+cs_sety = CsOperation("GEOSCoordSeq_setY")
+cs_setz = CsOperation("GEOSCoordSeq_setZ")
+
+# These routines return size & dimensions.
+cs_getsize = CsInt("GEOSCoordSeq_getSize")
+cs_getdims = CsInt("GEOSCoordSeq_getDimensions")
+
+cs_is_ccw = GEOSFuncFactory(
+    "GEOSCoordSeq_isCCW", restype=c_int, argtypes=[CS_PTR, POINTER(c_byte)]
+)
