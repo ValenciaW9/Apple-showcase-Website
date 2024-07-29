@@ -1,73 +1,92 @@
-import functools
-import inspect
+import logging
+from optparse import Values
+from typing import Any, Dict, List
+
+from pip._vendor.packaging.markers import default_environment
+from pip._vendor.rich import print_json
+
+from pip import __version__
+from pip._internal.cli import cmdoptions
+from pip._internal.cli.base_command import Command
+from pip._internal.cli.status_codes import SUCCESS
+from pip._internal.metadata import BaseDistribution, get_environment
+from pip._internal.utils.compat import stdlib_pkgs
+from pip._internal.utils.urls import path_to_url
+
+logger = logging.getLogger(__name__)
 
 
-@functools.lru_cache(maxsize=512)
-def _get_func_parameters(func, remove_first):
-    parameters = tuple(inspect.signature(func).parameters.values())
-    if remove_first:
-        parameters = parameters[1:]
-    return parameters
-
-
-def _get_callable_parameters(meth_or_func):
-    is_method = inspect.ismethod(meth_or_func)
-    func = meth_or_func.__func__ if is_method else meth_or_func
-    return _get_func_parameters(func, remove_first=is_method)
-
-
-def get_func_args(func):
-    params = _get_callable_parameters(func)
-    return [
-        param.name
-        for param in params
-        if param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
-    ]
-
-
-def get_func_full_args(func):
+class InspectCommand(Command):
     """
-    Return a list of (argument name, default value) tuples. If the argument
-    does not have a default value, omit it in the tuple. Arguments such as
-    *args and **kwargs are also included.
+    Inspect the content of a Python environment and produce a report in JSON format.
     """
-    params = _get_callable_parameters(func)
-    args = []
-    for param in params:
-        name = param.name
-        # Ignore 'self'
-        if name == "self":
-            continue
-        if param.kind == inspect.Parameter.VAR_POSITIONAL:
-            name = "*" + name
-        elif param.kind == inspect.Parameter.VAR_KEYWORD:
-            name = "**" + name
-        if param.default != inspect.Parameter.empty:
-            args.append((name, param.default))
+
+    ignore_require_venv = True
+    usage = """
+      %prog [options]"""
+
+    def add_options(self) -> None:
+        self.cmd_opts.add_option(
+            "--local",
+            action="store_true",
+            default=False,
+            help=(
+                "If in a virtualenv that has global access, do not list "
+                "globally-installed packages."
+            ),
+        )
+        self.cmd_opts.add_option(
+            "--user",
+            dest="user",
+            action="store_true",
+            default=False,
+            help="Only output packages installed in user-site.",
+        )
+        self.cmd_opts.add_option(cmdoptions.list_path())
+        self.parser.insert_option_group(0, self.cmd_opts)
+
+    def run(self, options: Values, args: List[str]) -> int:
+        cmdoptions.check_list_path_option(options)
+        dists = get_environment(options.path).iter_installed_distributions(
+            local_only=options.local,
+            user_only=options.user,
+            skip=set(stdlib_pkgs),
+        )
+        output = {
+            "version": "1",
+            "pip_version": __version__,
+            "installed": [self._dist_to_dict(dist) for dist in dists],
+            "environment": default_environment(),
+            # TODO tags? scheme?
+        }
+        print_json(data=output)
+        return SUCCESS
+
+    def _dist_to_dict(self, dist: BaseDistribution) -> Dict[str, Any]:
+        res: Dict[str, Any] = {
+            "metadata": dist.metadata_dict,
+            "metadata_location": dist.info_location,
+        }
+        # direct_url. Note that we don't have download_info (as in the installation
+        # report) since it is not recorded in installed metadata.
+        direct_url = dist.direct_url
+        if direct_url is not None:
+            res["direct_url"] = direct_url.to_dict()
         else:
-            args.append((name,))
-    return args
-
-
-def func_accepts_kwargs(func):
-    """Return True if function 'func' accepts keyword arguments **kwargs."""
-    return any(p for p in _get_callable_parameters(func) if p.kind == p.VAR_KEYWORD)
-
-
-def func_accepts_var_args(func):
-    """
-    Return True if function 'func' accepts positional arguments *args.
-    """
-    return any(p for p in _get_callable_parameters(func) if p.kind == p.VAR_POSITIONAL)
-
-
-def method_has_no_args(meth):
-    """Return True if a method only accepts 'self'."""
-    count = len(
-        [p for p in _get_callable_parameters(meth) if p.kind == p.POSITIONAL_OR_KEYWORD]
-    )
-    return count == 0 if inspect.ismethod(meth) else count == 1
-
-
-def func_supports_parameter(func, name):
-    return any(param.name == name for param in _get_callable_parameters(func))
+            # Emulate direct_url for legacy editable installs.
+            editable_project_location = dist.editable_project_location
+            if editable_project_location is not None:
+                res["direct_url"] = {
+                    "url": path_to_url(editable_project_location),
+                    "dir_info": {
+                        "editable": True,
+                    },
+                }
+        # installer
+        installer = dist.installer
+        if dist.installer:
+            res["installer"] = installer
+        # requested
+        if dist.installed_with_dist_info:
+            res["requested"] = dist.requested
+        return res
