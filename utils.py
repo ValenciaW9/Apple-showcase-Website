@@ -1,28 +1,12 @@
-"""
-A collection of utility routines and classes used by the spatial
-backends.
-"""
+from hashlib import md5
+
+TEMPLATE_FRAGMENT_KEY_TEMPLATE = "template.cache.%s.%s"
 
 
-class SpatialOperator:
-    """
-    Class encapsulating the behavior specific to a GIS operation (used by lookups).
-    """
-
-    sql_template = None
-
-    def __init__(self, op=None, func=None):
-        self.op = op
-        self.func = func
-
-    @property
-    def default_template(self):
-        if self.func:
-            return "%(func)s(%(lhs)s, %(rhs)s)"
-        else:
-            return "%(lhs)s %(op)s %(rhs)s"
-
-    def as_sql(self, connection, lookup, template_params, sql_params):
-        sql_template = self.sql_template or lookup.sql_template or self.default_template
-        template_params.update({"op": self.op, "func": self.func})
-        return sql_template % template_params, sql_params
+def make_template_fragment_key(fragment_name, vary_on=None):
+    hasher = md5(usedforsecurity=False)
+    if vary_on is not None:
+        for arg in vary_on:
+            hasher.update(str(arg).encode())
+            hasher.update(b":")
+    return TEMPLATE_FRAGMENT_KEY_TEMPLATE % (fragment_name, hasher.hexdigest())

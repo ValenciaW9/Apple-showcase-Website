@@ -1,71 +1,35 @@
-"""
- The GeometryColumns and SpatialRefSys models for the SpatiaLite backend.
-"""
-
-from django.contrib.gis.db.backends.base.models import SpatialRefSysMixin
+from django.contrib.sites.models import Site
 from django.db import models
+from django.utils.translation import gettext_lazy as _
 
 
-class SpatialiteGeometryColumns(models.Model):
-    """
-    The 'geometry_columns' table from SpatiaLite.
-    """
-
-    f_table_name = models.CharField(max_length=256)
-    f_geometry_column = models.CharField(max_length=256)
-    coord_dimension = models.IntegerField()
-    srid = models.IntegerField(primary_key=True)
-    spatial_index_enabled = models.IntegerField()
-    type = models.IntegerField(db_column="geometry_type")
+class Redirect(models.Model):
+    site = models.ForeignKey(Site, models.CASCADE, verbose_name=_("site"))
+    old_path = models.CharField(
+        _("redirect from"),
+        max_length=200,
+        db_index=True,
+        help_text=_(
+            "This should be an absolute path, excluding the domain name. Example: "
+            "“/events/search/”."
+        ),
+    )
+    new_path = models.CharField(
+        _("redirect to"),
+        max_length=200,
+        blank=True,
+        help_text=_(
+            "This can be either an absolute path (as above) or a full URL "
+            "starting with a scheme such as “https://”."
+        ),
+    )
 
     class Meta:
-        app_label = "gis"
-        db_table = "geometry_columns"
-        managed = False
+        verbose_name = _("redirect")
+        verbose_name_plural = _("redirects")
+        db_table = "django_redirect"
+        unique_together = [["site", "old_path"]]
+        ordering = ["old_path"]
 
     def __str__(self):
-        return "%s.%s - %dD %s field (SRID: %d)" % (
-            self.f_table_name,
-            self.f_geometry_column,
-            self.coord_dimension,
-            self.type,
-            self.srid,
-        )
-
-    @classmethod
-    def table_name_col(cls):
-        """
-        Return the name of the metadata column used to store the feature table
-        name.
-        """
-        return "f_table_name"
-
-    @classmethod
-    def geom_col_name(cls):
-        """
-        Return the name of the metadata column used to store the feature
-        geometry column.
-        """
-        return "f_geometry_column"
-
-
-class SpatialiteSpatialRefSys(models.Model, SpatialRefSysMixin):
-    """
-    The 'spatial_ref_sys' table from SpatiaLite.
-    """
-
-    srid = models.IntegerField(primary_key=True)
-    auth_name = models.CharField(max_length=256)
-    auth_srid = models.IntegerField()
-    ref_sys_name = models.CharField(max_length=256)
-    proj4text = models.CharField(max_length=2048)
-    srtext = models.CharField(max_length=2048)
-
-    class Meta:
-        app_label = "gis"
-        db_table = "spatial_ref_sys"
-        managed = False
-
-    @property
-    def wkt(self):
-        return self.srtext
+        return "%s ---> %s" % (self.old_path, self.new_path)
