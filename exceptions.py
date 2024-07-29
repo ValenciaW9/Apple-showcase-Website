@@ -1,25 +1,9 @@
-from django.core.exceptions import SuspiciousOperation
+from django.http import Http404
 
 
-class DisallowedModelAdminLookup(SuspiciousOperation):
-    """Invalid filter was passed to admin view via URL querystring"""
-
+class Resolver404(Http404):
     pass
 
 
-class DisallowedModelAdminToField(SuspiciousOperation):
-    """Invalid to_field was passed to admin view via URL query string"""
-
-    pass
-
-
-class AlreadyRegistered(Exception):
-    """The model is already registered."""
-
-    pass
-
-
-class NotRegistered(Exception):
-    """The model is not registered."""
-
+class NoReverseMatch(Exception):
     pass

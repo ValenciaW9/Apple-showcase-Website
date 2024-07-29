@@ -1,161 +1,187 @@
-import os
-from io import BytesIO, StringIO, UnsupportedOperation
+from urllib.parse import unquote, urlsplit, urlunsplit
 
-from django.core.files.utils import FileProxyMixin
-from django.utils.functional import cached_property
+from asgiref.local import Local
+
+from django.utils.functional import lazy
+from django.utils.translation import override
+
+from .exceptions import NoReverseMatch, Resolver404
+from .resolvers import _get_cached_resolver, get_ns_resolver, get_resolver
+from .utils import get_callable
+
+# SCRIPT_NAME prefixes for each thread are stored here. If there's no entry for
+# the current thread (which is the only one we ever access), it is assumed to
+# be empty.
+_prefixes = Local()
+
+# Overridden URLconfs for each thread are stored here.
+_urlconfs = Local()
 
 
-class File(FileProxyMixin):
-    DEFAULT_CHUNK_SIZE = 64 * 2**10
+def resolve(path, urlconf=None):
+    if urlconf is None:
+        urlconf = get_urlconf()
+    return get_resolver(urlconf).resolve(path)
 
-    def __init__(self, file, name=None):
-        self.file = file
-        if name is None:
-            name = getattr(file, "name", None)
-        self.name = name
-        if hasattr(file, "mode"):
-            self.mode = file.mode
 
-    def __str__(self):
-        return self.name or ""
+def reverse(viewname, urlconf=None, args=None, kwargs=None, current_app=None):
+    if urlconf is None:
+        urlconf = get_urlconf()
+    resolver = get_resolver(urlconf)
+    args = args or []
+    kwargs = kwargs or {}
 
-    def __repr__(self):
-        return "<%s: %s>" % (self.__class__.__name__, self or "None")
+    prefix = get_script_prefix()
 
-    def __bool__(self):
-        return bool(self.name)
+    if not isinstance(viewname, str):
+        view = viewname
+    else:
+        *path, view = viewname.split(":")
 
-    def __len__(self):
-        return self.size
-
-    @cached_property
-    def size(self):
-        if hasattr(self.file, "size"):
-            return self.file.size
-        if hasattr(self.file, "name"):
-            try:
-                return os.path.getsize(self.file.name)
-            except (OSError, TypeError):
-                pass
-        if hasattr(self.file, "tell") and hasattr(self.file, "seek"):
-            pos = self.file.tell()
-            self.file.seek(0, os.SEEK_END)
-            size = self.file.tell()
-            self.file.seek(pos)
-            return size
-        raise AttributeError("Unable to determine the file's size.")
-
-    def chunks(self, chunk_size=None):
-        """
-        Read the file and yield chunks of ``chunk_size`` bytes (defaults to
-        ``File.DEFAULT_CHUNK_SIZE``).
-        """
-        chunk_size = chunk_size or self.DEFAULT_CHUNK_SIZE
-        try:
-            self.seek(0)
-        except (AttributeError, UnsupportedOperation):
-            pass
-
-        while True:
-            data = self.read(chunk_size)
-            if not data:
-                break
-            yield data
-
-    def multiple_chunks(self, chunk_size=None):
-        """
-        Return ``True`` if you can expect multiple chunks.
-
-        NB: If a particular file representation is in memory, subclasses should
-        always return ``False`` -- there's no good reason to read from memory in
-        chunks.
-        """
-        return self.size > (chunk_size or self.DEFAULT_CHUNK_SIZE)
-
-    def __iter__(self):
-        # Iterate over this file-like object by newlines
-        buffer_ = None
-        for chunk in self.chunks():
-            for line in chunk.splitlines(True):
-                if buffer_:
-                    if endswith_cr(buffer_) and not equals_lf(line):
-                        # Line split after a \r newline; yield buffer_.
-                        yield buffer_
-                        # Continue with line.
-                    else:
-                        # Line either split without a newline (line
-                        # continues after buffer_) or with \r\n
-                        # newline (line == b'\n').
-                        line = buffer_ + line
-                    # buffer_ handled, clear it.
-                    buffer_ = None
-
-                # If this is the end of a \n or \r\n line, yield.
-                if endswith_lf(line):
-                    yield line
-                else:
-                    buffer_ = line
-
-        if buffer_ is not None:
-            yield buffer_
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, tb):
-        self.close()
-
-    def open(self, mode=None, *args, **kwargs):
-        if not self.closed:
-            self.seek(0)
-        elif self.name and os.path.exists(self.name):
-            self.file = open(self.name, mode or self.mode, *args, **kwargs)
+        if current_app:
+            current_path = current_app.split(":")
+            current_path.reverse()
         else:
-            raise ValueError("The file cannot be reopened.")
-        return self
+            current_path = None
 
-    def close(self):
-        self.file.close()
+        resolved_path = []
+        ns_pattern = ""
+        ns_converters = {}
+        for ns in path:
+            current_ns = current_path.pop() if current_path else None
+            # Lookup the name to see if it could be an app identifier.
+            try:
+                app_list = resolver.app_dict[ns]
+                # Yes! Path part matches an app in the current Resolver.
+                if current_ns and current_ns in app_list:
+                    # If we are reversing for a particular app, use that
+                    # namespace.
+                    ns = current_ns
+                elif ns not in app_list:
+                    # The name isn't shared by one of the instances (i.e.,
+                    # the default) so pick the first instance as the default.
+                    ns = app_list[0]
+            except KeyError:
+                pass
+
+            if ns != current_ns:
+                current_path = None
+
+            try:
+                extra, resolver = resolver.namespace_dict[ns]
+                resolved_path.append(ns)
+                ns_pattern += extra
+                ns_converters.update(resolver.pattern.converters)
+            except KeyError as key:
+                if resolved_path:
+                    raise NoReverseMatch(
+                        "%s is not a registered namespace inside '%s'"
+                        % (key, ":".join(resolved_path))
+                    )
+                else:
+                    raise NoReverseMatch("%s is not a registered namespace" % key)
+        if ns_pattern:
+            resolver = get_ns_resolver(
+                ns_pattern, resolver, tuple(ns_converters.items())
+            )
+
+    return resolver._reverse_with_prefix(view, prefix, *args, **kwargs)
 
 
-class ContentFile(File):
+reverse_lazy = lazy(reverse, str)
+
+
+def clear_url_caches():
+    get_callable.cache_clear()
+    _get_cached_resolver.cache_clear()
+    get_ns_resolver.cache_clear()
+
+
+def set_script_prefix(prefix):
     """
-    A File-like object that takes just raw content, rather than an actual file.
+    Set the script prefix for the current thread.
     """
+    if not prefix.endswith("/"):
+        prefix += "/"
+    _prefixes.value = prefix
 
-    def __init__(self, content, name=None):
-        stream_class = StringIO if isinstance(content, str) else BytesIO
-        super().__init__(stream_class(content), name=name)
-        self.size = len(content)
 
-    def __str__(self):
-        return "Raw content"
+def get_script_prefix():
+    """
+    Return the currently active script prefix. Useful for client code that
+    wishes to construct their own URLs manually (although accessing the request
+    instance is normally going to be a lot cleaner).
+    """
+    return getattr(_prefixes, "value", "/")
 
-    def __bool__(self):
-        return True
 
-    def open(self, mode=None):
-        self.seek(0)
-        return self
-
-    def close(self):
+def clear_script_prefix():
+    """
+    Unset the script prefix for the current thread.
+    """
+    try:
+        del _prefixes.value
+    except AttributeError:
         pass
 
-    def write(self, data):
-        self.__dict__.pop("size", None)  # Clear the computed size.
-        return self.file.write(data)
+
+def set_urlconf(urlconf_name):
+    """
+    Set the URLconf for the current thread (overriding the default one in
+    settings). If urlconf_name is None, revert back to the default.
+    """
+    if urlconf_name:
+        _urlconfs.value = urlconf_name
+    else:
+        if hasattr(_urlconfs, "value"):
+            del _urlconfs.value
 
 
-def endswith_cr(line):
-    """Return True if line (a text or bytestring) ends with '\r'."""
-    return line.endswith("\r" if isinstance(line, str) else b"\r")
+def get_urlconf(default=None):
+    """
+    Return the root URLconf to use for the current thread if it has been
+    changed from the default one.
+    """
+    return getattr(_urlconfs, "value", default)
 
 
-def endswith_lf(line):
-    """Return True if line (a text or bytestring) ends with '\n'."""
-    return line.endswith("\n" if isinstance(line, str) else b"\n")
+def is_valid_path(path, urlconf=None):
+    """
+    Return the ResolverMatch if the given path resolves against the default URL
+    resolver, False otherwise. This is a convenience method to make working
+    with "is this a match?" cases easier, avoiding try...except blocks.
+    """
+    try:
+        return resolve(path, urlconf)
+    except Resolver404:
+        return False
 
 
-def equals_lf(line):
-    """Return True if line (a text or bytestring) equals '\n'."""
-    return line == ("\n" if isinstance(line, str) else b"\n")
+def translate_url(url, lang_code):
+    """
+    Given a URL (absolute or relative), try to get its translated version in
+    the `lang_code` language (either by i18n_patterns or by translated regex).
+    Return the original URL if no translated version is found.
+    """
+    parsed = urlsplit(url)
+    try:
+        # URL may be encoded.
+        match = resolve(unquote(parsed.path))
+    except Resolver404:
+        pass
+    else:
+        to_be_reversed = (
+            "%s:%s" % (match.namespace, match.url_name)
+            if match.namespace
+            else match.url_name
+        )
+        with override(lang_code):
+            try:
+                url = reverse(to_be_reversed, args=match.args, kwargs=match.kwargs)
+            except NoReverseMatch:
+                pass
+            else:
+                url = urlunsplit(
+                    (parsed.scheme, parsed.netloc, url, parsed.query, parsed.fragment)
+                )
+    return url
