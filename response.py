@@ -1,164 +1,107 @@
-from django.http import HttpResponse
+"""
+The Response class in REST framework is similar to HTTPResponse, except that
+it is initialized with unrendered data, instead of a pre-rendered string.
 
-from .loader import get_template, select_template
+The appropriate renderer is called during Django's template response rendering.
+"""
+from http.client import responses
+
+from django.template.response import SimpleTemplateResponse
+
+from rest_framework.serializers import Serializer
 
 
-class ContentNotRenderedError(Exception):
-    pass
+class Response(SimpleTemplateResponse):
+    """
+    An HttpResponse that allows its data to be rendered into
+    arbitrary media types.
+    """
 
-
-class SimpleTemplateResponse(HttpResponse):
-    rendering_attrs = ["template_name", "context_data", "_post_render_callbacks"]
-
-    def __init__(
-        self,
-        template,
-        context=None,
-        content_type=None,
-        status=None,
-        charset=None,
-        using=None,
-        headers=None,
-    ):
-        # It would seem obvious to call these next two members 'template' and
-        # 'context', but those names are reserved as part of the test Client
-        # API. To avoid the name collision, we use different names.
-        self.template_name = template
-        self.context_data = context
-
-        self.using = using
-
-        self._post_render_callbacks = []
-
-        # _request stores the current request object in subclasses that know
-        # about requests, like TemplateResponse. It's defined in the base class
-        # to minimize code duplication.
-        # It's called self._request because self.request gets overwritten by
-        # django.test.client.Client. Unlike template_name and context_data,
-        # _request should not be considered part of the public API.
-        self._request = None
-
-        # content argument doesn't make sense here because it will be replaced
-        # with rendered template so we always pass empty string in order to
-        # prevent errors and provide shorter signature.
-        super().__init__("", content_type, status, charset=charset, headers=headers)
-
-        # _is_rendered tracks whether the template and context has been baked
-        # into a final response.
-        # Super __init__ doesn't know any better than to set self.content to
-        # the empty string we just gave it, which wrongly sets _is_rendered
-        # True, so we initialize it to False after the call to super __init__.
-        self._is_rendered = False
-
-    def __getstate__(self):
+    def __init__(self, data=None, status=None,
+                 template_name=None, headers=None,
+                 exception=False, content_type=None):
         """
-        Raise an exception if trying to pickle an unrendered response. Pickle
-        only rendered data, not the data used to construct the response.
+        Alters the init arguments slightly.
+        For example, drop 'template_name', and instead use 'data'.
+
+        Setting 'renderer' and 'media_type' will typically be deferred,
+        For example being set automatically by the `APIView`.
         """
-        obj_dict = self.__dict__.copy()
-        if not self._is_rendered:
-            raise ContentNotRenderedError(
-                "The response content must be rendered before it can be pickled."
+        super().__init__(None, status=status)
+
+        if isinstance(data, Serializer):
+            msg = (
+                'You passed a Serializer instance as data, but '
+                'probably meant to pass serialized `.data` or '
+                '`.error`. representation.'
             )
-        for attr in self.rendering_attrs:
-            if attr in obj_dict:
-                del obj_dict[attr]
+            raise AssertionError(msg)
 
-        return obj_dict
+        self.data = data
+        self.template_name = template_name
+        self.exception = exception
+        self.content_type = content_type
 
-    def resolve_template(self, template):
-        """Accept a template object, path-to-template, or list of paths."""
-        if isinstance(template, (list, tuple)):
-            return select_template(template, using=self.using)
-        elif isinstance(template, str):
-            return get_template(template, using=self.using)
-        else:
-            return template
+        if headers:
+            for name, value in headers.items():
+                self[name] = value
 
-    def resolve_context(self, context):
-        return context
+    # Allow generic typing checking for responses.
+    def __class_getitem__(cls, *args, **kwargs):
+        return cls
 
     @property
     def rendered_content(self):
-        """Return the freshly rendered content for the template and context
-        described by the TemplateResponse.
+        renderer = getattr(self, 'accepted_renderer', None)
+        accepted_media_type = getattr(self, 'accepted_media_type', None)
+        context = getattr(self, 'renderer_context', None)
 
-        This *does not* set the final content of the response. To set the
-        response content, you must either call render(), or set the
-        content explicitly using the value of this property.
-        """
-        template = self.resolve_template(self.template_name)
-        context = self.resolve_context(self.context_data)
-        return template.render(context, self._request)
+        assert renderer, ".accepted_renderer not set on Response"
+        assert accepted_media_type, ".accepted_media_type not set on Response"
+        assert context is not None, ".renderer_context not set on Response"
+        context['response'] = self
 
-    def add_post_render_callback(self, callback):
-        """Add a new post-rendering callback.
+        media_type = renderer.media_type
+        charset = renderer.charset
+        content_type = self.content_type
 
-        If the response has already been rendered,
-        invoke the callback immediately.
-        """
-        if self._is_rendered:
-            callback(self)
-        else:
-            self._post_render_callbacks.append(callback)
+        if content_type is None and charset is not None:
+            content_type = "{}; charset={}".format(media_type, charset)
+        elif content_type is None:
+            content_type = media_type
+        self['Content-Type'] = content_type
 
-    def render(self):
-        """Render (thereby finalizing) the content of the response.
+        ret = renderer.render(self.data, accepted_media_type, context)
+        if isinstance(ret, str):
+            assert charset, (
+                'renderer returned unicode, and did not specify '
+                'a charset value.'
+            )
+            return ret.encode(charset)
 
-        If the content has already been rendered, this is a no-op.
+        if not ret:
+            del self['Content-Type']
 
-        Return the baked response instance.
-        """
-        retval = self
-        if not self._is_rendered:
-            self.content = self.rendered_content
-            for post_callback in self._post_render_callbacks:
-                newretval = post_callback(retval)
-                if newretval is not None:
-                    retval = newretval
-        return retval
+        return ret
 
     @property
-    def is_rendered(self):
-        return self._is_rendered
+    def status_text(self):
+        """
+        Returns reason text corresponding to our HTTP response status code.
+        Provided for convenience.
+        """
+        return responses.get(self.status_code, '')
 
-    def __iter__(self):
-        if not self._is_rendered:
-            raise ContentNotRenderedError(
-                "The response content must be rendered before it can be iterated over."
-            )
-        return super().__iter__()
-
-    @property
-    def content(self):
-        if not self._is_rendered:
-            raise ContentNotRenderedError(
-                "The response content must be rendered before it can be accessed."
-            )
-        return super().content
-
-    @content.setter
-    def content(self, value):
-        """Set the content for the response."""
-        HttpResponse.content.fset(self, value)
-        self._is_rendered = True
-
-
-class TemplateResponse(SimpleTemplateResponse):
-    rendering_attrs = SimpleTemplateResponse.rendering_attrs + ["_request"]
-
-    def __init__(
-        self,
-        request,
-        template,
-        context=None,
-        content_type=None,
-        status=None,
-        charset=None,
-        using=None,
-        headers=None,
-    ):
-        super().__init__(
-            template, context, content_type, status, charset, using, headers=headers
-        )
-        self._request = request
+    def __getstate__(self):
+        """
+        Remove attributes from the response that shouldn't be cached.
+        """
+        state = super().__getstate__()
+        for key in (
+            'accepted_renderer', 'renderer_context', 'resolver_match',
+            'client', 'request', 'json', 'wsgi_request'
+        ):
+            if key in state:
+                del state[key]
+        state['_closable_objects'] = []
+        return state

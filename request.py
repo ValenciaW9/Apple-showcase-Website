@@ -1,738 +1,460 @@
-import codecs
-import copy
-from io import BytesIO
-from itertools import chain
-from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit
+"""
+The Request class is used as a wrapper around the standard request object.
+
+The wrapped request then offers a richer API, in particular :
+
+    - content automatically parsed according to `Content-Type` header,
+      and available as `request.data`
+    - full support of PUT method, including support for file uploads
+    - form overloading of HTTP method, content type and content
+"""
+import io
+import sys
+from contextlib import contextmanager
 
 from django.conf import settings
-from django.core import signing
-from django.core.exceptions import (
-    BadRequest,
-    DisallowedHost,
-    ImproperlyConfigured,
-    RequestDataTooBig,
-    TooManyFieldsSent,
-)
-from django.core.files import uploadhandler
-from django.http.multipartparser import (
-    MultiPartParser,
-    MultiPartParserError,
-    TooManyFilesSent,
-)
-from django.utils.datastructures import (
-    CaseInsensitiveMapping,
-    ImmutableList,
-    MultiValueDict,
-)
-from django.utils.encoding import escape_uri_path, iri_to_uri
-from django.utils.functional import cached_property
-from django.utils.http import is_same_domain, parse_header_parameters
-from django.utils.regex_helper import _lazy_re_compile
+from django.http import HttpRequest, QueryDict
+from django.http.request import RawPostDataException
+from django.utils.datastructures import MultiValueDict
+from django.utils.http import parse_header_parameters
 
-RAISE_ERROR = object()
-host_validation_re = _lazy_re_compile(
-    r"^([a-z0-9.-]+|\[[a-f0-9]*:[a-f0-9.:]+\])(?::([0-9]+))?$"
-)
+from rest_framework import exceptions
+from rest_framework.settings import api_settings
 
 
-class UnreadablePostError(OSError):
+def is_form_media_type(media_type):
+    """
+    Return True if the media type is a valid form media type.
+    """
+    base_media_type, params = parse_header_parameters(media_type)
+    return (base_media_type == 'application/x-www-form-urlencoded' or
+            base_media_type == 'multipart/form-data')
+
+
+class override_method:
+    """
+    A context manager that temporarily overrides the method on a request,
+    additionally setting the `view.request` attribute.
+
+    Usage:
+
+        with override_method(view, request, 'POST') as request:
+            ... # Do stuff with `view` and `request`
+    """
+
+    def __init__(self, view, request, method):
+        self.view = view
+        self.request = request
+        self.method = method
+        self.action = getattr(view, 'action', None)
+
+    def __enter__(self):
+        self.view.request = clone_request(self.request, self.method)
+        # For viewsets we also set the `.action` attribute.
+        action_map = getattr(self.view, 'action_map', {})
+        self.view.action = action_map.get(self.method.lower())
+        return self.view.request
+
+    def __exit__(self, *args, **kwarg):
+        self.view.request = self.request
+        self.view.action = self.action
+
+
+class WrappedAttributeError(Exception):
     pass
 
 
-class RawPostDataException(Exception):
+@contextmanager
+def wrap_attributeerrors():
     """
-    You cannot access raw_post_data from a request that has
-    multipart/* POST data if it has been accessed via POST,
-    FILES, etc..
+    Used to re-raise AttributeErrors caught during authentication, preventing
+    these errors from otherwise being handled by the attribute access protocol.
     """
+    try:
+        yield
+    except AttributeError:
+        info = sys.exc_info()
+        exc = WrappedAttributeError(str(info[1]))
+        raise exc.with_traceback(info[2])
 
+
+class Empty:
+    """
+    Placeholder for unset attributes.
+    Cannot use `None`, as that may be a valid value.
+    """
     pass
 
 
-class HttpRequest:
-    """A basic HTTP request."""
+def _hasattr(obj, name):
+    return not getattr(obj, name) is Empty
 
-    # The encoding used in GET/POST dicts. None means use default setting.
-    _encoding = None
-    _upload_handlers = []
 
-    def __init__(self):
-        # WARNING: The `WSGIRequest` subclass doesn't call `super`.
-        # Any variable assignment made here should also happen in
-        # `WSGIRequest.__init__()`.
+def clone_request(request, method):
+    """
+    Internal helper method to clone a request, replacing with a different
+    HTTP method.  Used for checking permissions against other methods.
+    """
+    ret = Request(request=request._request,
+                  parsers=request.parsers,
+                  authenticators=request.authenticators,
+                  negotiator=request.negotiator,
+                  parser_context=request.parser_context)
+    ret._data = request._data
+    ret._files = request._files
+    ret._full_data = request._full_data
+    ret._content_type = request._content_type
+    ret._stream = request._stream
+    ret.method = method
+    if hasattr(request, '_user'):
+        ret._user = request._user
+    if hasattr(request, '_auth'):
+        ret._auth = request._auth
+    if hasattr(request, '_authenticator'):
+        ret._authenticator = request._authenticator
+    if hasattr(request, 'accepted_renderer'):
+        ret.accepted_renderer = request.accepted_renderer
+    if hasattr(request, 'accepted_media_type'):
+        ret.accepted_media_type = request.accepted_media_type
+    if hasattr(request, 'version'):
+        ret.version = request.version
+    if hasattr(request, 'versioning_scheme'):
+        ret.versioning_scheme = request.versioning_scheme
+    return ret
 
-        self.GET = QueryDict(mutable=True)
-        self.POST = QueryDict(mutable=True)
-        self.COOKIES = {}
-        self.META = {}
-        self.FILES = MultiValueDict()
 
-        self.path = ""
-        self.path_info = ""
-        self.method = None
-        self.resolver_match = None
-        self.content_type = None
-        self.content_params = None
+class ForcedAuthentication:
+    """
+    This authentication class is used if the test client or request factory
+    forcibly authenticated the request.
+    """
+
+    def __init__(self, force_user, force_token):
+        self.force_user = force_user
+        self.force_token = force_token
+
+    def authenticate(self, request):
+        return (self.force_user, self.force_token)
+
+
+class Request:
+    """
+    Wrapper allowing to enhance a standard `HttpRequest` instance.
+
+    Kwargs:
+        - request(HttpRequest). The original request instance.
+        - parsers(list/tuple). The parsers to use for parsing the
+          request content.
+        - authenticators(list/tuple). The authenticators used to try
+          authenticating the request's user.
+    """
+
+    def __init__(self, request, parsers=None, authenticators=None,
+                 negotiator=None, parser_context=None):
+        assert isinstance(request, HttpRequest), (
+            'The `request` argument must be an instance of '
+            '`django.http.HttpRequest`, not `{}.{}`.'
+            .format(request.__class__.__module__, request.__class__.__name__)
+        )
+
+        self._request = request
+        self.parsers = parsers or ()
+        self.authenticators = authenticators or ()
+        self.negotiator = negotiator or self._default_negotiator()
+        self.parser_context = parser_context
+        self._data = Empty
+        self._files = Empty
+        self._full_data = Empty
+        self._content_type = Empty
+        self._stream = Empty
+
+        if self.parser_context is None:
+            self.parser_context = {}
+        self.parser_context['request'] = self
+        self.parser_context['encoding'] = request.encoding or settings.DEFAULT_CHARSET
+
+        force_user = getattr(request, '_force_auth_user', None)
+        force_token = getattr(request, '_force_auth_token', None)
+        if force_user is not None or force_token is not None:
+            forced_auth = ForcedAuthentication(force_user, force_token)
+            self.authenticators = (forced_auth,)
 
     def __repr__(self):
-        if self.method is None or not self.get_full_path():
-            return "<%s>" % self.__class__.__name__
-        return "<%s: %s %r>" % (
+        return '<%s.%s: %s %r>' % (
+            self.__class__.__module__,
             self.__class__.__name__,
             self.method,
-            self.get_full_path(),
-        )
+            self.get_full_path())
 
-    @cached_property
-    def headers(self):
-        return HttpHeaders(self.META)
+    # Allow generic typing checking for requests.
+    def __class_getitem__(cls, *args, **kwargs):
+        return cls
 
-    @cached_property
-    def accepted_types(self):
-        """Return a list of MediaType instances."""
-        return parse_accept_header(self.headers.get("Accept", "*/*"))
+    def _default_negotiator(self):
+        return api_settings.DEFAULT_CONTENT_NEGOTIATION_CLASS()
 
-    def accepts(self, media_type):
-        return any(
-            accepted_type.match(media_type) for accepted_type in self.accepted_types
-        )
+    @property
+    def content_type(self):
+        meta = self._request.META
+        return meta.get('CONTENT_TYPE', meta.get('HTTP_CONTENT_TYPE', ''))
 
-    def _set_content_type_params(self, meta):
-        """Set content_type, content_params, and encoding."""
-        self.content_type, self.content_params = parse_header_parameters(
-            meta.get("CONTENT_TYPE", "")
-        )
-        if "charset" in self.content_params:
-            try:
-                codecs.lookup(self.content_params["charset"])
-            except LookupError:
-                pass
+    @property
+    def stream(self):
+        """
+        Returns an object that may be used to stream the request content.
+        """
+        if not _hasattr(self, '_stream'):
+            self._load_stream()
+        return self._stream
+
+    @property
+    def query_params(self):
+        """
+        More semantically correct name for request.GET.
+        """
+        return self._request.GET
+
+    @property
+    def data(self):
+        if not _hasattr(self, '_full_data'):
+            self._load_data_and_files()
+        return self._full_data
+
+    @property
+    def user(self):
+        """
+        Returns the user associated with the current request, as authenticated
+        by the authentication classes provided to the request.
+        """
+        if not hasattr(self, '_user'):
+            with wrap_attributeerrors():
+                self._authenticate()
+        return self._user
+
+    @user.setter
+    def user(self, value):
+        """
+        Sets the user on the current request. This is necessary to maintain
+        compatibility with django.contrib.auth where the user property is
+        set in the login and logout functions.
+
+        Note that we also set the user on Django's underlying `HttpRequest`
+        instance, ensuring that it is available to any middleware in the stack.
+        """
+        self._user = value
+        self._request.user = value
+
+    @property
+    def auth(self):
+        """
+        Returns any non-user authentication information associated with the
+        request, such as an authentication token.
+        """
+        if not hasattr(self, '_auth'):
+            with wrap_attributeerrors():
+                self._authenticate()
+        return self._auth
+
+    @auth.setter
+    def auth(self, value):
+        """
+        Sets any non-user authentication information associated with the
+        request, such as an authentication token.
+        """
+        self._auth = value
+        self._request.auth = value
+
+    @property
+    def successful_authenticator(self):
+        """
+        Return the instance of the authentication instance class that was used
+        to authenticate the request, or `None`.
+        """
+        if not hasattr(self, '_authenticator'):
+            with wrap_attributeerrors():
+                self._authenticate()
+        return self._authenticator
+
+    def _load_data_and_files(self):
+        """
+        Parses the request content into `self.data`.
+        """
+        if not _hasattr(self, '_data'):
+            self._data, self._files = self._parse()
+            if self._files:
+                self._full_data = self._data.copy()
+                self._full_data.update(self._files)
             else:
-                self.encoding = self.content_params["charset"]
+                self._full_data = self._data
 
-    def _get_raw_host(self):
+            # if a form media type, copy data & files refs to the underlying
+            # http request so that closable objects are handled appropriately.
+            if is_form_media_type(self.content_type):
+                self._request._post = self.POST
+                self._request._files = self.FILES
+
+    def _load_stream(self):
         """
-        Return the HTTP host using the environment or request headers. Skip
-        allowed hosts protection, so may return an insecure host.
+        Return the content body of the request, as a stream.
         """
-        # We try three options, in order of decreasing preference.
-        if settings.USE_X_FORWARDED_HOST and ("HTTP_X_FORWARDED_HOST" in self.META):
-            host = self.META["HTTP_X_FORWARDED_HOST"]
-        elif "HTTP_HOST" in self.META:
-            host = self.META["HTTP_HOST"]
-        else:
-            # Reconstruct the host using the algorithm from PEP 333.
-            host = self.META["SERVER_NAME"]
-            server_port = self.get_port()
-            if server_port != ("443" if self.is_secure() else "80"):
-                host = "%s:%s" % (host, server_port)
-        return host
-
-    def get_host(self):
-        """Return the HTTP host using the environment or request headers."""
-        host = self._get_raw_host()
-
-        # Allow variants of localhost if ALLOWED_HOSTS is empty and DEBUG=True.
-        allowed_hosts = settings.ALLOWED_HOSTS
-        if settings.DEBUG and not allowed_hosts:
-            allowed_hosts = [".localhost", "127.0.0.1", "[::1]"]
-
-        domain, port = split_domain_port(host)
-        if domain and validate_host(domain, allowed_hosts):
-            return host
-        else:
-            msg = "Invalid HTTP_HOST header: %r." % host
-            if domain:
-                msg += " You may need to add %r to ALLOWED_HOSTS." % domain
-            else:
-                msg += (
-                    " The domain name provided is not valid according to RFC 1034/1035."
-                )
-            raise DisallowedHost(msg)
-
-    def get_port(self):
-        """Return the port number for the request as a string."""
-        if settings.USE_X_FORWARDED_PORT and "HTTP_X_FORWARDED_PORT" in self.META:
-            port = self.META["HTTP_X_FORWARDED_PORT"]
-        else:
-            port = self.META["SERVER_PORT"]
-        return str(port)
-
-    def get_full_path(self, force_append_slash=False):
-        return self._get_full_path(self.path, force_append_slash)
-
-    def get_full_path_info(self, force_append_slash=False):
-        return self._get_full_path(self.path_info, force_append_slash)
-
-    def _get_full_path(self, path, force_append_slash):
-        # RFC 3986 requires query string arguments to be in the ASCII range.
-        # Rather than crash if this doesn't happen, we encode defensively.
-        return "%s%s%s" % (
-            escape_uri_path(path),
-            "/" if force_append_slash and not path.endswith("/") else "",
-            (
-                ("?" + iri_to_uri(self.META.get("QUERY_STRING", "")))
-                if self.META.get("QUERY_STRING", "")
-                else ""
-            ),
-        )
-
-    def get_signed_cookie(self, key, default=RAISE_ERROR, salt="", max_age=None):
-        """
-        Attempt to return a signed cookie. If the signature fails or the
-        cookie has expired, raise an exception, unless the `default` argument
-        is provided,  in which case return that value.
-        """
+        meta = self._request.META
         try:
-            cookie_value = self.COOKIES[key]
-        except KeyError:
-            if default is not RAISE_ERROR:
-                return default
-            else:
-                raise
-        try:
-            value = signing.get_cookie_signer(salt=key + salt).unsign(
-                cookie_value, max_age=max_age
+            content_length = int(
+                meta.get('CONTENT_LENGTH', meta.get('HTTP_CONTENT_LENGTH', 0))
             )
-        except signing.BadSignature:
-            if default is not RAISE_ERROR:
-                return default
-            else:
-                raise
-        return value
+        except (ValueError, TypeError):
+            content_length = 0
 
-    def build_absolute_uri(self, location=None):
-        """
-        Build an absolute URI from the location and the variables available in
-        this request. If no ``location`` is specified, build the absolute URI
-        using request.get_full_path(). If the location is absolute, convert it
-        to an RFC 3987 compliant URI and return it. If location is relative or
-        is scheme-relative (i.e., ``//example.com/``), urljoin() it to a base
-        URL constructed from the request variables.
-        """
-        if location is None:
-            # Make it an absolute url (but schemeless and domainless) for the
-            # edge case that the path starts with '//'.
-            location = "//%s" % self.get_full_path()
+        if content_length == 0:
+            self._stream = None
+        elif not self._request._read_started:
+            self._stream = self._request
         else:
-            # Coerce lazy locations.
-            location = str(location)
-        bits = urlsplit(location)
-        if not (bits.scheme and bits.netloc):
-            # Handle the simple, most common case. If the location is absolute
-            # and a scheme or host (netloc) isn't provided, skip an expensive
-            # urljoin() as long as no path segments are '.' or '..'.
-            if (
-                bits.path.startswith("/")
-                and not bits.scheme
-                and not bits.netloc
-                and "/./" not in bits.path
-                and "/../" not in bits.path
-            ):
-                # If location starts with '//' but has no netloc, reuse the
-                # schema and netloc from the current request. Strip the double
-                # slashes and continue as if it wasn't specified.
-                location = self._current_scheme_host + location.removeprefix("//")
-            else:
-                # Join the constructed URL with the provided location, which
-                # allows the provided location to apply query strings to the
-                # base path.
-                location = urljoin(self._current_scheme_host + self.path, location)
-        return iri_to_uri(location)
+            self._stream = io.BytesIO(self.body)
 
-    @cached_property
-    def _current_scheme_host(self):
-        return "{}://{}".format(self.scheme, self.get_host())
-
-    def _get_scheme(self):
+    def _supports_form_parsing(self):
         """
-        Hook for subclasses like WSGIRequest to implement. Return 'http' by
-        default.
+        Return True if this requests supports parsing form data.
         """
-        return "http"
-
-    @property
-    def scheme(self):
-        if settings.SECURE_PROXY_SSL_HEADER:
-            try:
-                header, secure_value = settings.SECURE_PROXY_SSL_HEADER
-            except ValueError:
-                raise ImproperlyConfigured(
-                    "The SECURE_PROXY_SSL_HEADER setting must be a tuple containing "
-                    "two values."
-                )
-            header_value = self.META.get(header)
-            if header_value is not None:
-                header_value, *_ = header_value.split(",", 1)
-                return "https" if header_value.strip() == secure_value else "http"
-        return self._get_scheme()
-
-    def is_secure(self):
-        return self.scheme == "https"
-
-    @property
-    def encoding(self):
-        return self._encoding
-
-    @encoding.setter
-    def encoding(self, val):
-        """
-        Set the encoding used for GET/POST accesses. If the GET or POST
-        dictionary has already been created, remove and recreate it on the
-        next access (so that it is decoded correctly).
-        """
-        self._encoding = val
-        if hasattr(self, "GET"):
-            del self.GET
-        if hasattr(self, "_post"):
-            del self._post
-
-    def _initialize_handlers(self):
-        self._upload_handlers = [
-            uploadhandler.load_handler(handler, self)
-            for handler in settings.FILE_UPLOAD_HANDLERS
-        ]
-
-    @property
-    def upload_handlers(self):
-        if not self._upload_handlers:
-            # If there are no upload handlers defined, initialize them from settings.
-            self._initialize_handlers()
-        return self._upload_handlers
-
-    @upload_handlers.setter
-    def upload_handlers(self, upload_handlers):
-        if hasattr(self, "_files"):
-            raise AttributeError(
-                "You cannot set the upload handlers after the upload has been "
-                "processed."
-            )
-        self._upload_handlers = upload_handlers
-
-    def parse_file_upload(self, META, post_data):
-        """Return a tuple of (POST QueryDict, FILES MultiValueDict)."""
-        self.upload_handlers = ImmutableList(
-            self.upload_handlers,
-            warning=(
-                "You cannot alter upload handlers after the upload has been "
-                "processed."
-            ),
+        form_media = (
+            'application/x-www-form-urlencoded',
+            'multipart/form-data'
         )
-        parser = MultiPartParser(META, post_data, self.upload_handlers, self.encoding)
-        return parser.parse()
+        return any(parser.media_type in form_media for parser in self.parsers)
 
-    @property
-    def body(self):
-        if not hasattr(self, "_body"):
-            if self._read_started:
-                raise RawPostDataException(
-                    "You cannot access body after reading from request's data stream"
-                )
+    def _parse(self):
+        """
+        Parse the request content, returning a two-tuple of (data, files)
 
-            # Limit the maximum request data size that will be handled in-memory.
-            if (
-                settings.DATA_UPLOAD_MAX_MEMORY_SIZE is not None
-                and int(self.META.get("CONTENT_LENGTH") or 0)
-                > settings.DATA_UPLOAD_MAX_MEMORY_SIZE
-            ):
-                raise RequestDataTooBig(
-                    "Request body exceeded settings.DATA_UPLOAD_MAX_MEMORY_SIZE."
-                )
-
-            try:
-                self._body = self.read()
-            except OSError as e:
-                raise UnreadablePostError(*e.args) from e
-            finally:
-                self._stream.close()
-            self._stream = BytesIO(self._body)
-        return self._body
-
-    def _mark_post_parse_error(self):
-        self._post = QueryDict()
-        self._files = MultiValueDict()
-
-    def _load_post_and_files(self):
-        """Populate self._post and self._files if the content-type is a form type"""
-        if self.method != "POST":
-            self._post, self._files = (
-                QueryDict(encoding=self._encoding),
-                MultiValueDict(),
-            )
-            return
-        if self._read_started and not hasattr(self, "_body"):
-            self._mark_post_parse_error()
-            return
-
-        if self.content_type == "multipart/form-data":
-            if hasattr(self, "_body"):
-                # Use already read data
-                data = BytesIO(self._body)
-            else:
-                data = self
-            try:
-                self._post, self._files = self.parse_file_upload(self.META, data)
-            except (MultiPartParserError, TooManyFilesSent):
-                # An error occurred while parsing POST data. Since when
-                # formatting the error the request handler might access
-                # self.POST, set self._post and self._file to prevent
-                # attempts to parse POST data again.
-                self._mark_post_parse_error()
+        May raise an `UnsupportedMediaType`, or `ParseError` exception.
+        """
+        media_type = self.content_type
+        try:
+            stream = self.stream
+        except RawPostDataException:
+            if not hasattr(self._request, '_post'):
                 raise
-        elif self.content_type == "application/x-www-form-urlencoded":
-            # According to RFC 1866, the "application/x-www-form-urlencoded"
-            # content type does not have a charset and should be always treated
-            # as UTF-8.
-            if self._encoding is not None and self._encoding.lower() != "utf-8":
-                raise BadRequest(
-                    "HTTP requests with the 'application/x-www-form-urlencoded' "
-                    "content type must be UTF-8 encoded."
-                )
-            self._post = QueryDict(self.body, encoding="utf-8")
+            # If request.POST has been accessed in middleware, and a method='POST'
+            # request was made with 'multipart/form-data', then the request stream
+            # will already have been exhausted.
+            if self._supports_form_parsing():
+                return (self._request.POST, self._request.FILES)
+            stream = None
+
+        if stream is None or media_type is None:
+            if media_type and is_form_media_type(media_type):
+                empty_data = QueryDict('', encoding=self._request._encoding)
+            else:
+                empty_data = {}
+            empty_files = MultiValueDict()
+            return (empty_data, empty_files)
+
+        parser = self.negotiator.select_parser(self, self.parsers)
+
+        if not parser:
+            raise exceptions.UnsupportedMediaType(media_type)
+
+        try:
+            parsed = parser.parse(stream, media_type, self.parser_context)
+        except Exception:
+            # If we get an exception during parsing, fill in empty data and
+            # re-raise.  Ensures we don't simply repeat the error when
+            # attempting to render the browsable renderer response, or when
+            # logging the request or similar.
+            self._data = QueryDict('', encoding=self._request._encoding)
             self._files = MultiValueDict()
-        else:
-            self._post, self._files = (
-                QueryDict(encoding=self._encoding),
-                MultiValueDict(),
-            )
+            self._full_data = self._data
+            raise
 
-    def close(self):
-        if hasattr(self, "_files"):
-            for f in chain.from_iterable(list_[1] for list_ in self._files.lists()):
-                f.close()
-
-    # File-like and iterator interface.
-    #
-    # Expects self._stream to be set to an appropriate source of bytes by
-    # a corresponding request subclass (e.g. WSGIRequest).
-    # Also when request data has already been read by request.POST or
-    # request.body, self._stream points to a BytesIO instance
-    # containing that data.
-
-    def read(self, *args, **kwargs):
-        self._read_started = True
+        # Parser classes may return the raw data, or a
+        # DataAndFiles object.  Unpack the result as required.
         try:
-            return self._stream.read(*args, **kwargs)
-        except OSError as e:
-            raise UnreadablePostError(*e.args) from e
+            return (parsed.data, parsed.files)
+        except AttributeError:
+            empty_files = MultiValueDict()
+            return (parsed, empty_files)
 
-    def readline(self, *args, **kwargs):
-        self._read_started = True
-        try:
-            return self._stream.readline(*args, **kwargs)
-        except OSError as e:
-            raise UnreadablePostError(*e.args) from e
-
-    def __iter__(self):
-        return iter(self.readline, b"")
-
-    def readlines(self):
-        return list(self)
-
-
-class HttpHeaders(CaseInsensitiveMapping):
-    HTTP_PREFIX = "HTTP_"
-    # PEP 333 gives two headers which aren't prepended with HTTP_.
-    UNPREFIXED_HEADERS = {"CONTENT_TYPE", "CONTENT_LENGTH"}
-
-    def __init__(self, environ):
-        headers = {}
-        for header, value in environ.items():
-            name = self.parse_header_name(header)
-            if name:
-                headers[name] = value
-        super().__init__(headers)
-
-    def __getitem__(self, key):
-        """Allow header lookup using underscores in place of hyphens."""
-        return super().__getitem__(key.replace("_", "-"))
-
-    @classmethod
-    def parse_header_name(cls, header):
-        if header.startswith(cls.HTTP_PREFIX):
-            header = header.removeprefix(cls.HTTP_PREFIX)
-        elif header not in cls.UNPREFIXED_HEADERS:
-            return None
-        return header.replace("_", "-").title()
-
-    @classmethod
-    def to_wsgi_name(cls, header):
-        header = header.replace("-", "_").upper()
-        if header in cls.UNPREFIXED_HEADERS:
-            return header
-        return f"{cls.HTTP_PREFIX}{header}"
-
-    @classmethod
-    def to_asgi_name(cls, header):
-        return header.replace("-", "_").upper()
-
-    @classmethod
-    def to_wsgi_names(cls, headers):
-        return {
-            cls.to_wsgi_name(header_name): value
-            for header_name, value in headers.items()
-        }
-
-    @classmethod
-    def to_asgi_names(cls, headers):
-        return {
-            cls.to_asgi_name(header_name): value
-            for header_name, value in headers.items()
-        }
-
-
-class QueryDict(MultiValueDict):
-    """
-    A specialized MultiValueDict which represents a query string.
-
-    A QueryDict can be used to represent GET or POST data. It subclasses
-    MultiValueDict since keys in such data can be repeated, for instance
-    in the data from a form with a <select multiple> field.
-
-    By default QueryDicts are immutable, though the copy() method
-    will always return a mutable copy.
-
-    Both keys and values set on this class are converted from the given encoding
-    (DEFAULT_CHARSET by default) to str.
-    """
-
-    # These are both reset in __init__, but is specified here at the class
-    # level so that unpickling will have valid values
-    _mutable = True
-    _encoding = None
-
-    def __init__(self, query_string=None, mutable=False, encoding=None):
-        super().__init__()
-        self.encoding = encoding or settings.DEFAULT_CHARSET
-        query_string = query_string or ""
-        parse_qsl_kwargs = {
-            "keep_blank_values": True,
-            "encoding": self.encoding,
-            "max_num_fields": settings.DATA_UPLOAD_MAX_NUMBER_FIELDS,
-        }
-        if isinstance(query_string, bytes):
-            # query_string normally contains URL-encoded data, a subset of ASCII.
+    def _authenticate(self):
+        """
+        Attempt to authenticate the request using each authentication instance
+        in turn.
+        """
+        for authenticator in self.authenticators:
             try:
-                query_string = query_string.decode(self.encoding)
-            except UnicodeDecodeError:
-                # ... but some user agents are misbehaving :-(
-                query_string = query_string.decode("iso-8859-1")
-        try:
-            for key, value in parse_qsl(query_string, **parse_qsl_kwargs):
-                self.appendlist(key, value)
-        except ValueError as e:
-            # ValueError can also be raised if the strict_parsing argument to
-            # parse_qsl() is True. As that is not used by Django, assume that
-            # the exception was raised by exceeding the value of max_num_fields
-            # instead of fragile checks of exception message strings.
-            raise TooManyFieldsSent(
-                "The number of GET/POST parameters exceeded "
-                "settings.DATA_UPLOAD_MAX_NUMBER_FIELDS."
-            ) from e
-        self._mutable = mutable
+                user_auth_tuple = authenticator.authenticate(self)
+            except exceptions.APIException:
+                self._not_authenticated()
+                raise
 
-    @classmethod
-    def fromkeys(cls, iterable, value="", mutable=False, encoding=None):
+            if user_auth_tuple is not None:
+                self._authenticator = authenticator
+                self.user, self.auth = user_auth_tuple
+                return
+
+        self._not_authenticated()
+
+    def _not_authenticated(self):
         """
-        Return a new QueryDict with keys (may be repeated) from an iterable and
-        values from value.
+        Set authenticator, user & authtoken representing an unauthenticated request.
+
+        Defaults are None, AnonymousUser & None.
         """
-        q = cls("", mutable=True, encoding=encoding)
-        for key in iterable:
-            q.appendlist(key, value)
-        if not mutable:
-            q._mutable = False
-        return q
+        self._authenticator = None
 
-    @property
-    def encoding(self):
-        if self._encoding is None:
-            self._encoding = settings.DEFAULT_CHARSET
-        return self._encoding
-
-    @encoding.setter
-    def encoding(self, value):
-        self._encoding = value
-
-    def _assert_mutable(self):
-        if not self._mutable:
-            raise AttributeError("This QueryDict instance is immutable")
-
-    def __setitem__(self, key, value):
-        self._assert_mutable()
-        key = bytes_to_text(key, self.encoding)
-        value = bytes_to_text(value, self.encoding)
-        super().__setitem__(key, value)
-
-    def __delitem__(self, key):
-        self._assert_mutable()
-        super().__delitem__(key)
-
-    def __copy__(self):
-        result = self.__class__("", mutable=True, encoding=self.encoding)
-        for key, value in self.lists():
-            result.setlist(key, value)
-        return result
-
-    def __deepcopy__(self, memo):
-        result = self.__class__("", mutable=True, encoding=self.encoding)
-        memo[id(self)] = result
-        for key, value in self.lists():
-            result.setlist(copy.deepcopy(key, memo), copy.deepcopy(value, memo))
-        return result
-
-    def setlist(self, key, list_):
-        self._assert_mutable()
-        key = bytes_to_text(key, self.encoding)
-        list_ = [bytes_to_text(elt, self.encoding) for elt in list_]
-        super().setlist(key, list_)
-
-    def setlistdefault(self, key, default_list=None):
-        self._assert_mutable()
-        return super().setlistdefault(key, default_list)
-
-    def appendlist(self, key, value):
-        self._assert_mutable()
-        key = bytes_to_text(key, self.encoding)
-        value = bytes_to_text(value, self.encoding)
-        super().appendlist(key, value)
-
-    def pop(self, key, *args):
-        self._assert_mutable()
-        return super().pop(key, *args)
-
-    def popitem(self):
-        self._assert_mutable()
-        return super().popitem()
-
-    def clear(self):
-        self._assert_mutable()
-        super().clear()
-
-    def setdefault(self, key, default=None):
-        self._assert_mutable()
-        key = bytes_to_text(key, self.encoding)
-        default = bytes_to_text(default, self.encoding)
-        return super().setdefault(key, default)
-
-    def copy(self):
-        """Return a mutable copy of this object."""
-        return self.__deepcopy__({})
-
-    def urlencode(self, safe=None):
-        """
-        Return an encoded string of all query string arguments.
-
-        `safe` specifies characters which don't require quoting, for example::
-
-            >>> q = QueryDict(mutable=True)
-            >>> q['next'] = '/a&b/'
-            >>> q.urlencode()
-            'next=%2Fa%26b%2F'
-            >>> q.urlencode(safe='/')
-            'next=/a%26b/'
-        """
-        output = []
-        if safe:
-            safe = safe.encode(self.encoding)
-
-            def encode(k, v):
-                return "%s=%s" % ((quote(k, safe), quote(v, safe)))
-
+        if api_settings.UNAUTHENTICATED_USER:
+            self.user = api_settings.UNAUTHENTICATED_USER()
         else:
+            self.user = None
 
-            def encode(k, v):
-                return urlencode({k: v})
+        if api_settings.UNAUTHENTICATED_TOKEN:
+            self.auth = api_settings.UNAUTHENTICATED_TOKEN()
+        else:
+            self.auth = None
 
-        for k, list_ in self.lists():
-            output.extend(
-                encode(k.encode(self.encoding), str(v).encode(self.encoding))
-                for v in list_
-            )
-        return "&".join(output)
-
-
-class MediaType:
-    def __init__(self, media_type_raw_line):
-        full_type, self.params = parse_header_parameters(
-            media_type_raw_line if media_type_raw_line else ""
-        )
-        self.main_type, _, self.sub_type = full_type.partition("/")
-
-    def __str__(self):
-        params_str = "".join("; %s=%s" % (k, v) for k, v in self.params.items())
-        return "%s%s%s" % (
-            self.main_type,
-            ("/%s" % self.sub_type) if self.sub_type else "",
-            params_str,
-        )
-
-    def __repr__(self):
-        return "<%s: %s>" % (self.__class__.__qualname__, self)
+    def __getattr__(self, attr):
+        """
+        If an attribute does not exist on this instance, then we also attempt
+        to proxy it to the underlying HttpRequest object.
+        """
+        try:
+            _request = self.__getattribute__("_request")
+            return getattr(_request, attr)
+        except AttributeError:
+            return self.__getattribute__(attr)
 
     @property
-    def is_all_types(self):
-        return self.main_type == "*" and self.sub_type == "*"
+    def DATA(self):
+        raise NotImplementedError(
+            '`request.DATA` has been deprecated in favor of `request.data` '
+            'since version 3.0, and has been fully removed as of version 3.2.'
+        )
 
-    def match(self, other):
-        if self.is_all_types:
-            return True
-        other = MediaType(other)
-        if self.main_type == other.main_type and self.sub_type in {"*", other.sub_type}:
-            return True
-        return False
+    @property
+    def POST(self):
+        # Ensure that request.POST uses our request parsing.
+        if not _hasattr(self, '_data'):
+            self._load_data_and_files()
+        if is_form_media_type(self.content_type):
+            return self._data
+        return QueryDict('', encoding=self._request._encoding)
 
+    @property
+    def FILES(self):
+        # Leave this one alone for backwards compat with Django's request.FILES
+        # Different from the other two cases, which are not valid property
+        # names on the WSGIRequest class.
+        if not _hasattr(self, '_files'):
+            self._load_data_and_files()
+        return self._files
 
-# It's neither necessary nor appropriate to use
-# django.utils.encoding.force_str() for parsing URLs and form inputs. Thus,
-# this slightly more restricted function, used by QueryDict.
-def bytes_to_text(s, encoding):
-    """
-    Convert bytes objects to strings, using the given encoding. Illegally
-    encoded input characters are replaced with Unicode "unknown" codepoint
-    (\ufffd).
+    @property
+    def QUERY_PARAMS(self):
+        raise NotImplementedError(
+            '`request.QUERY_PARAMS` has been deprecated in favor of `request.query_params` '
+            'since version 3.0, and has been fully removed as of version 3.2.'
+        )
 
-    Return any non-bytes objects without change.
-    """
-    if isinstance(s, bytes):
-        return str(s, encoding, "replace")
-    else:
-        return s
-
-
-def split_domain_port(host):
-    """
-    Return a (domain, port) tuple from a given host.
-
-    Returned domain is lowercased. If the host is invalid, the domain will be
-    empty.
-    """
-    if match := host_validation_re.fullmatch(host.lower()):
-        domain, port = match.groups(default="")
-        # Remove a trailing dot (if present) from the domain.
-        return domain.removesuffix("."), port
-    return "", ""
-
-
-def validate_host(host, allowed_hosts):
-    """
-    Validate the given host for this site.
-
-    Check that the host looks valid and matches a host or host pattern in the
-    given list of ``allowed_hosts``. Any pattern beginning with a period
-    matches a domain and all its subdomains (e.g. ``.example.com`` matches
-    ``example.com`` and any subdomain), ``*`` matches anything, and anything
-    else must match exactly.
-
-    Note: This function assumes that the given host is lowercased and has
-    already had the port, if any, stripped off.
-
-    Return ``True`` for a valid host, ``False`` otherwise.
-    """
-    return any(
-        pattern == "*" or is_same_domain(host, pattern) for pattern in allowed_hosts
-    )
-
-
-def parse_accept_header(header):
-    return [MediaType(token) for token in header.split(",") if token.strip()]
+    def force_plaintext_errors(self, value):
+        # Hack to allow our exception handler to force choice of
+        # plaintext or html error responses.
+        self._request.is_ajax = lambda: value
