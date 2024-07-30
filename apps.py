@@ -1,7 +1,10 @@
 from django.apps import AppConfig
-from django.utils.translation import gettext_lazy as _
 
 
-class SyndicationConfig(AppConfig):
-    name = "django.contrib.syndication"
-    verbose_name = _("Syndication")
+class RestFrameworkConfig(AppConfig):
+    name = 'rest_framework'
+    verbose_name = "Django REST framework"
+
+    def ready(self):
+        # Add System checks
+        from .checks import pagination_system_check  # NOQA

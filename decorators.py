@@ -1,225 +1,233 @@
-"Functions that help with dynamically creating decorators for views."
+"""
+The most important decorator in this module is `@api_view`, which is used
+for writing function-based views with REST framework.
 
-from functools import partial, update_wrapper, wraps
+There are also various decorators for setting the API policies on function
+based views, as well as the `@action` decorator, which is used to annotate
+methods on viewsets that should be included by routers.
+"""
+import types
 
-from asgiref.sync import iscoroutinefunction
+from django.forms.utils import pretty_name
 
-
-class classonlymethod(classmethod):
-    def __get__(self, instance, cls=None):
-        if instance is not None:
-            raise AttributeError(
-                "This method is available only on the class, not on instances."
-            )
-        return super().__get__(instance, cls)
-
-
-def _update_method_wrapper(_wrapper, decorator):
-    # _multi_decorate()'s bound_method isn't available in this scope. Cheat by
-    # using it on a dummy function.
-    @decorator
-    def dummy(*args, **kwargs):
-        pass
-
-    update_wrapper(_wrapper, dummy)
+from rest_framework.views import APIView
 
 
-def _multi_decorate(decorators, method):
+def api_view(http_method_names=None):
     """
-    Decorate `method` with one or more function decorators. `decorators` can be
-    a single decorator or an iterable of decorators.
+    Decorator that converts a function-based view into an APIView subclass.
+    Takes a list of allowed methods for the view as an argument.
     """
-    if hasattr(decorators, "__iter__"):
-        # Apply a list/tuple of decorators if 'decorators' is one. Decorator
-        # functions are applied so that the call order is the same as the
-        # order in which they appear in the iterable.
-        decorators = decorators[::-1]
-    else:
-        decorators = [decorators]
+    http_method_names = ['GET'] if (http_method_names is None) else http_method_names
 
-    def _wrapper(self, *args, **kwargs):
-        # bound_method has the signature that 'decorator' expects i.e. no
-        # 'self' argument, but it's a closure over self so it can call
-        # 'func'. Also, wrap method.__get__() in a function because new
-        # attributes can't be set on bound method objects, only on functions.
-        bound_method = wraps(method)(partial(method.__get__(self, type(self))))
-        for dec in decorators:
-            bound_method = dec(bound_method)
-        return bound_method(*args, **kwargs)
+    def decorator(func):
 
-    # Copy any attributes that a decorator adds to the function it decorates.
-    for dec in decorators:
-        _update_method_wrapper(_wrapper, dec)
-    # Preserve any existing attributes of 'method', including the name.
-    update_wrapper(_wrapper, method)
-    return _wrapper
+        WrappedAPIView = type(
+            'WrappedAPIView',
+            (APIView,),
+            {'__doc__': func.__doc__}
+        )
+
+        # Note, the above allows us to set the docstring.
+        # It is the equivalent of:
+        #
+        #     class WrappedAPIView(APIView):
+        #         pass
+        #     WrappedAPIView.__doc__ = func.doc    <--- Not possible to do this
+
+        # api_view applied without (method_names)
+        assert not isinstance(http_method_names, types.FunctionType), \
+            '@api_view missing list of allowed HTTP methods'
+
+        # api_view applied with eg. string instead of list of strings
+        assert isinstance(http_method_names, (list, tuple)), \
+            '@api_view expected a list of strings, received %s' % type(http_method_names).__name__
+
+        allowed_methods = set(http_method_names) | {'options'}
+        WrappedAPIView.http_method_names = [method.lower() for method in allowed_methods]
+
+        def handler(self, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        for method in http_method_names:
+            setattr(WrappedAPIView, method.lower(), handler)
+
+        WrappedAPIView.__name__ = func.__name__
+        WrappedAPIView.__module__ = func.__module__
+
+        WrappedAPIView.renderer_classes = getattr(func, 'renderer_classes',
+                                                  APIView.renderer_classes)
+
+        WrappedAPIView.parser_classes = getattr(func, 'parser_classes',
+                                                APIView.parser_classes)
+
+        WrappedAPIView.authentication_classes = getattr(func, 'authentication_classes',
+                                                        APIView.authentication_classes)
+
+        WrappedAPIView.throttle_classes = getattr(func, 'throttle_classes',
+                                                  APIView.throttle_classes)
+
+        WrappedAPIView.permission_classes = getattr(func, 'permission_classes',
+                                                    APIView.permission_classes)
+
+        WrappedAPIView.schema = getattr(func, 'schema',
+                                        APIView.schema)
+
+        return WrappedAPIView.as_view()
+
+    return decorator
 
 
-def method_decorator(decorator, name=""):
+def renderer_classes(renderer_classes):
+    def decorator(func):
+        func.renderer_classes = renderer_classes
+        return func
+    return decorator
+
+
+def parser_classes(parser_classes):
+    def decorator(func):
+        func.parser_classes = parser_classes
+        return func
+    return decorator
+
+
+def authentication_classes(authentication_classes):
+    def decorator(func):
+        func.authentication_classes = authentication_classes
+        return func
+    return decorator
+
+
+def throttle_classes(throttle_classes):
+    def decorator(func):
+        func.throttle_classes = throttle_classes
+        return func
+    return decorator
+
+
+def permission_classes(permission_classes):
+    def decorator(func):
+        func.permission_classes = permission_classes
+        return func
+    return decorator
+
+
+def schema(view_inspector):
+    def decorator(func):
+        func.schema = view_inspector
+        return func
+    return decorator
+
+
+def action(methods=None, detail=None, url_path=None, url_name=None, **kwargs):
     """
-    Convert a function decorator into a method decorator
+    Mark a ViewSet method as a routable action.
+
+    `@action`-decorated functions will be endowed with a `mapping` property,
+    a `MethodMapper` that can be used to add additional method-based behaviors
+    on the routed action.
+
+    :param methods: A list of HTTP method names this action responds to.
+                    Defaults to GET only.
+    :param detail: Required. Determines whether this action applies to
+                   instance/detail requests or collection/list requests.
+    :param url_path: Define the URL segment for this action. Defaults to the
+                     name of the method decorated.
+    :param url_name: Define the internal (`reverse`) URL name for this action.
+                     Defaults to the name of the method decorated with underscores
+                     replaced with dashes.
+    :param kwargs: Additional properties to set on the view.  This can be used
+                   to override viewset-level *_classes settings, equivalent to
+                   how the `@renderer_classes` etc. decorators work for function-
+                   based API views.
+    """
+    methods = ['get'] if methods is None else methods
+    methods = [method.lower() for method in methods]
+
+    assert detail is not None, (
+        "@action() missing required argument: 'detail'"
+    )
+
+    # name and suffix are mutually exclusive
+    if 'name' in kwargs and 'suffix' in kwargs:
+        raise TypeError("`name` and `suffix` are mutually exclusive arguments.")
+
+    def decorator(func):
+        func.mapping = MethodMapper(func, methods)
+
+        func.detail = detail
+        func.url_path = url_path if url_path else func.__name__
+        func.url_name = url_name if url_name else func.__name__.replace('_', '-')
+
+        # These kwargs will end up being passed to `ViewSet.as_view()` within
+        # the router, which eventually delegates to Django's CBV `View`,
+        # which assigns them as instance attributes for each request.
+        func.kwargs = kwargs
+
+        # Set descriptive arguments for viewsets
+        if 'name' not in kwargs and 'suffix' not in kwargs:
+            func.kwargs['name'] = pretty_name(func.__name__)
+        func.kwargs['description'] = func.__doc__ or None
+
+        return func
+    return decorator
+
+
+class MethodMapper(dict):
+    """
+    Enables mapping HTTP methods to different ViewSet methods for a single,
+    logical action.
+
+    Example usage:
+
+        class MyViewSet(ViewSet):
+
+            @action(detail=False)
+            def example(self, request, **kwargs):
+                ...
+
+            @example.mapping.post
+            def create_example(self, request, **kwargs):
+                ...
     """
 
-    # 'obj' can be a class or a function. If 'obj' is a function at the time it
-    # is passed to _dec,  it will eventually be a method of the class it is
-    # defined on. If 'obj' is a class, the 'name' is required to be the name
-    # of the method that will be decorated.
-    def _dec(obj):
-        if not isinstance(obj, type):
-            return _multi_decorate(decorator, obj)
-        if not (name and hasattr(obj, name)):
-            raise ValueError(
-                "The keyword argument `name` must be the name of a method "
-                "of the decorated class: %s. Got '%s' instead." % (obj, name)
-            )
-        method = getattr(obj, name)
-        if not callable(method):
-            raise TypeError(
-                "Cannot decorate '%s' as it isn't a callable attribute of "
-                "%s (%s)." % (name, obj, method)
-            )
-        _wrapper = _multi_decorate(decorator, method)
-        setattr(obj, name, _wrapper)
-        return obj
+    def __init__(self, action, methods):
+        self.action = action
+        for method in methods:
+            self[method] = self.action.__name__
 
-    # Don't worry about making _dec look similar to a list/tuple as it's rather
-    # meaningless.
-    if not hasattr(decorator, "__iter__"):
-        update_wrapper(_dec, decorator)
-    # Change the name to aid debugging.
-    obj = decorator if hasattr(decorator, "__name__") else decorator.__class__
-    _dec.__name__ = "method_decorator(%s)" % obj.__name__
-    return _dec
+    def _map(self, method, func):
+        assert method not in self, (
+            "Method '%s' has already been mapped to '.%s'." % (method, self[method]))
+        assert func.__name__ != self.action.__name__, (
+            "Method mapping does not behave like the property decorator. You "
+            "cannot use the same method name for each mapping declaration.")
 
+        self[method] = func.__name__
 
-def decorator_from_middleware_with_args(middleware_class):
-    """
-    Like decorator_from_middleware, but return a function
-    that accepts the arguments to be passed to the middleware_class.
-    Use like::
+        return func
 
-         cache_page = decorator_from_middleware_with_args(CacheMiddleware)
-         # ...
+    def get(self, func):
+        return self._map('get', func)
 
-         @cache_page(3600)
-         def my_view(request):
-             # ...
-    """
-    return make_middleware_decorator(middleware_class)
+    def post(self, func):
+        return self._map('post', func)
 
+    def put(self, func):
+        return self._map('put', func)
 
-def decorator_from_middleware(middleware_class):
-    """
-    Given a middleware class (not an instance), return a view decorator. This
-    lets you use middleware functionality on a per-view basis. The middleware
-    is created with no params passed.
-    """
-    return make_middleware_decorator(middleware_class)()
+    def patch(self, func):
+        return self._map('patch', func)
 
+    def delete(self, func):
+        return self._map('delete', func)
 
-def make_middleware_decorator(middleware_class):
-    def _make_decorator(*m_args, **m_kwargs):
-        def _decorator(view_func):
-            middleware = middleware_class(view_func, *m_args, **m_kwargs)
+    def head(self, func):
+        return self._map('head', func)
 
-            def _pre_process_request(request, *args, **kwargs):
-                if hasattr(middleware, "process_request"):
-                    result = middleware.process_request(request)
-                    if result is not None:
-                        return result
-                if hasattr(middleware, "process_view"):
-                    result = middleware.process_view(request, view_func, args, kwargs)
-                    if result is not None:
-                        return result
-                return None
+    def options(self, func):
+        return self._map('options', func)
 
-            def _process_exception(request, exception):
-                if hasattr(middleware, "process_exception"):
-                    result = middleware.process_exception(request, exception)
-                    if result is not None:
-                        return result
-                raise
-
-            def _post_process_request(request, response):
-                if hasattr(response, "render") and callable(response.render):
-                    if hasattr(middleware, "process_template_response"):
-                        response = middleware.process_template_response(
-                            request, response
-                        )
-                    # Defer running of process_response until after the template
-                    # has been rendered:
-                    if hasattr(middleware, "process_response"):
-
-                        def callback(response):
-                            return middleware.process_response(request, response)
-
-                        response.add_post_render_callback(callback)
-                else:
-                    if hasattr(middleware, "process_response"):
-                        return middleware.process_response(request, response)
-                return response
-
-            if iscoroutinefunction(view_func):
-
-                async def _view_wrapper(request, *args, **kwargs):
-                    result = _pre_process_request(request, *args, **kwargs)
-                    if result is not None:
-                        return result
-
-                    try:
-                        response = await view_func(request, *args, **kwargs)
-                    except Exception as e:
-                        result = _process_exception(request, e)
-                        if result is not None:
-                            return result
-
-                    return _post_process_request(request, response)
-
-            else:
-
-                def _view_wrapper(request, *args, **kwargs):
-                    result = _pre_process_request(request, *args, **kwargs)
-                    if result is not None:
-                        return result
-
-                    try:
-                        response = view_func(request, *args, **kwargs)
-                    except Exception as e:
-                        result = _process_exception(request, e)
-                        if result is not None:
-                            return result
-
-                    return _post_process_request(request, response)
-
-            return wraps(view_func)(_view_wrapper)
-
-        return _decorator
-
-    return _make_decorator
-
-
-def sync_and_async_middleware(func):
-    """
-    Mark a middleware factory as returning a hybrid middleware supporting both
-    types of request.
-    """
-    func.sync_capable = True
-    func.async_capable = True
-    return func
-
-
-def sync_only_middleware(func):
-    """
-    Mark a middleware factory as returning a sync middleware.
-    This is the default.
-    """
-    func.sync_capable = True
-    func.async_capable = False
-    return func
-
-
-def async_only_middleware(func):
-    """Mark a middleware factory as returning an async middleware."""
-    func.sync_capable = False
-    func.async_capable = True
-    return func
+    def trace(self, func):
+        return self._map('trace', func)
